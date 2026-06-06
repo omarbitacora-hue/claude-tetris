@@ -27,6 +27,13 @@ const PIECES = [
 ];
 
 const LINE_SCORES = [0, 100, 300, 500, 800];
+const SPECIAL_CHANCE = 0.10; // 10% probability per piece
+
+const WILD = 8;
+COLORS[WILD] = '#eceff1'; // wildcard - silver
+
+const SPECIALS = ['bomb', 'ray', 'dye', 'gravity', 'freeze'];
+const SPECIAL_ICONS = { bomb: '💣', ray: '⚡', dye: '🎨', gravity: '⬇', freeze: '❄' };
 
 const canvas = document.getElementById('board');
 const ctx = canvas.getContext('2d');
@@ -41,9 +48,78 @@ const overlayScore = document.getElementById('overlay-score');
 const restartBtn = document.getElementById('restart-btn');
 
 let board, current, next, score, lines, level, paused, gameOver, lastTime, dropAccum, dropInterval, animId;
+let specialBag, freezeUntil;
 
 function createBoard() {
   return Array.from({ length: ROWS }, () => new Array(COLS).fill(0));
+}
+
+function shuffle(arr) {
+  for (let i = arr.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [arr[i], arr[j]] = [arr[j], arr[i]];
+  }
+  return arr;
+}
+
+function nextSpecialType() {
+  if (!specialBag.length) specialBag = shuffle([...SPECIALS]);
+  return specialBag.pop();
+}
+
+function makeSpecial() {
+  const special = nextSpecialType();
+  return { special, type: WILD, shape: [[WILD]], x: Math.floor(COLS / 2), y: 0 };
+}
+
+function compactColumns() {
+  for (let c = 0; c < COLS; c++) {
+    const blocks = [];
+    for (let r = ROWS - 1; r >= 0; r--) {
+      if (board[r][c]) blocks.push(board[r][c]);
+    }
+    for (let r = ROWS - 1; r >= 0; r--) {
+      board[r][c] = blocks.length ? blocks.shift() : 0;
+    }
+  }
+}
+
+function applySpecial(p) {
+  const px = p.x, py = p.y;
+  switch (p.special) {
+    case 'bomb':
+      for (let dr = -1; dr <= 1; dr++)
+        for (let dc = -1; dc <= 1; dc++) {
+          const r = py + dr, c = px + dc;
+          if (r >= 0 && r < ROWS && c >= 0 && c < COLS) board[r][c] = 0;
+        }
+      break;
+    case 'ray':
+      if (py >= 0 && py < ROWS) board[py].fill(0);
+      for (let r = 0; r < ROWS; r++) board[r][px] = 0;
+      break;
+    case 'dye': {
+      const freq = new Array(8).fill(0);
+      for (let r = 0; r < ROWS; r++)
+        for (let c = 0; c < COLS; c++)
+          if (board[r][c] >= 1 && board[r][c] <= 7) freq[board[r][c]]++;
+      let top = 0, topIdx = 0;
+      for (let i = 1; i <= 7; i++) if (freq[i] > top) { top = freq[i]; topIdx = i; }
+      if (topIdx) {
+        for (let r = 0; r < ROWS; r++)
+          for (let c = 0; c < COLS; c++)
+            if (board[r][c] === topIdx) board[r][c] = WILD;
+      }
+      break;
+    }
+    case 'gravity':
+      compactColumns();
+      break;
+    case 'freeze':
+      freezeUntil = performance.now() + 5000;
+      break;
+  }
+  score += 50 * level;
 }
 
 function randomPiece() {
@@ -104,10 +180,17 @@ function clearLines() {
     }
   }
   if (cleared) {
+    // remove wildcards left on the board and compact
+    for (let r = 0; r < ROWS; r++)
+      for (let c = 0; c < COLS; c++)
+        if (board[r][c] === WILD) board[r][c] = 0;
+    compactColumns();
+
     lines += cleared;
     score += (LINE_SCORES[cleared] || 0) * level;
     level = Math.floor(lines / 10) + 1;
     dropInterval = Math.max(100, 1000 - (level - 1) * 90);
+
     updateHUD();
   }
 }
@@ -136,14 +219,15 @@ function softDrop() {
 }
 
 function lockPiece() {
-  merge();
+  if (current.special) applySpecial(current);
+  else merge();
   clearLines();
   spawn();
 }
 
 function spawn() {
   current = next;
-  next = randomPiece();
+  next = Math.random() < SPECIAL_CHANCE ? makeSpecial() : randomPiece();
   if (collide(current.shape, current.x, current.y)) {
     endGame();
   }
@@ -154,6 +238,14 @@ function updateHUD() {
   scoreEl.textContent = score.toLocaleString();
   linesEl.textContent = lines;
   levelEl.textContent = level;
+}
+
+function drawSpecialIcon(context, x, y, special, size) {
+  context.font = `${Math.floor(size * 0.65)}px serif`;
+  context.textAlign = 'center';
+  context.textBaseline = 'middle';
+  context.globalAlpha = 1;
+  context.fillText(SPECIAL_ICONS[special], x * size + size / 2, y * size + size / 2);
 }
 
 function drawBlock(context, x, y, colorIndex, size, alpha) {
@@ -191,20 +283,27 @@ function draw() {
 
   // board
   for (let r = 0; r < ROWS; r++)
-    for (let c = 0; c < COLS; c++)
+    for (let c = 0; c < COLS; c++) {
       drawBlock(ctx, c, r, board[r][c], BLOCK);
+      if (board[r][c] === WILD) drawSpecialIcon(ctx, c, r, 'dye', BLOCK);
+    }
 
-  // ghost
-  const gy = ghostY();
-  for (let r = 0; r < current.shape.length; r++)
-    for (let c = 0; c < current.shape[r].length; c++)
-      if (current.shape[r][c])
-        drawBlock(ctx, current.x + c, gy + r, current.shape[r][c], BLOCK, 0.2);
+  // ghost (skip for special pieces)
+  if (!current.special) {
+    const gy = ghostY();
+    for (let r = 0; r < current.shape.length; r++)
+      for (let c = 0; c < current.shape[r].length; c++)
+        if (current.shape[r][c])
+          drawBlock(ctx, current.x + c, gy + r, current.shape[r][c], BLOCK, 0.2);
+  }
 
   // current piece
   for (let r = 0; r < current.shape.length; r++)
     for (let c = 0; c < current.shape[r].length; c++)
-      drawBlock(ctx, current.x + c, current.y + r, current.shape[r][c], BLOCK);
+      if (current.shape[r][c]) {
+        drawBlock(ctx, current.x + c, current.y + r, current.shape[r][c], BLOCK);
+        if (current.special) drawSpecialIcon(ctx, current.x + c, current.y + r, current.special, BLOCK);
+      }
 }
 
 function drawNext() {
@@ -215,7 +314,10 @@ function drawNext() {
   const offY = Math.floor((4 - shape.length) / 2);
   for (let r = 0; r < shape.length; r++)
     for (let c = 0; c < shape[r].length; c++)
-      drawBlock(nextCtx, offX + c, offY + r, shape[r][c], NB);
+      if (shape[r][c]) {
+        drawBlock(nextCtx, offX + c, offY + r, shape[r][c], NB);
+        if (next.special) drawSpecialIcon(nextCtx, offX + c, offY + r, next.special, NB);
+      }
 }
 
 function endGame() {
@@ -244,6 +346,12 @@ function loop(ts) {
   if (gameOver || paused) return;
   const dt = ts - lastTime;
   lastTime = ts;
+  if (performance.now() < freezeUntil) {
+    dropAccum = 0;
+    draw();
+    animId = requestAnimationFrame(loop);
+    return;
+  }
   dropAccum += dt;
   if (dropAccum >= dropInterval) {
     dropAccum = 0;
@@ -267,6 +375,8 @@ function init() {
   dropInterval = 1000;
   dropAccum = 0;
   lastTime = performance.now();
+  specialBag = [];
+  freezeUntil = 0;
   next = randomPiece();
   spawn();
   updateHUD();
